@@ -1,0 +1,394 @@
+"""
+ Copyright (c) 2023, salesforce.com, inc.
+ All rights reserved.
+ SPDX-License-Identifier: BSD-3-Clause
+ For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
+"""
+import logging
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from torch.cuda.amp import autocast as autocast
+from torch.nn import functional as F
+
+from lavis.common.registry import registry
+from lavis.models.base_model import all_gather_with_grad, concat_all_gather
+from lavis.models.blip2_models.blip2 import (
+    Blip2Base,
+    compute_sim_matrix,
+    disabled_train,
+)
+from lavis.models.blip_models.blip_outputs import BlipOutput, BlipOutputFeatures
+
+@registry.register_model("qformer_T2IT_reranker")
+class QformerT2ITReranker(Blip2Base):
+    PRETRAINED_MODEL_CONFIG_DICT = {
+        "pretrain": "configs/models/blip2/blip2_pretrain.yaml",
+        "pretrain_vitL": "configs/models/blip2/blip2_pretrain_vitL.yaml",
+        "coco": "configs/models/blip2/blip2_coco.yaml",
+    }
+    
+    def __init__(
+        self,
+        vit_model="eva_clip_g",
+        img_size=224,
+        drop_path_rate=0,
+        use_grad_checkpoint=False,
+        vit_precision="fp16",
+        freeze_vit=True,
+        num_query_token=32,
+        cross_attention_freq=2,
+        embed_dim=256,
+        max_txt_len=512, # max length of the text : 512 enough for caption and question 
+    ):
+        super().__init__()
+
+        self.tokenizer = self.init_tokenizer()
+
+        self.visual_encoder, self.ln_vision = self.init_vision_encoder(
+            vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
+        )
+        if freeze_vit:
+            for name, param in self.visual_encoder.named_parameters():
+                param.requires_grad = False
+            self.visual_encoder = self.visual_encoder.eval()
+            self.visual_encoder.train = disabled_train
+            logging.info("freeze vision encoder")
+        self.Qformer, self.query_tokens = self.init_Qformer(
+            num_query_token, self.visual_encoder.num_features, cross_attention_freq
+        )
+        self.Qformer.resize_token_embeddings(len(self.tokenizer))
+        state_dict = self.Qformer.state_dict()
+        for name, param in self.Qformer.named_parameters():
+            if "_query" in name:
+                key_orig = name.replace("_query", "")
+                param.data.copy_(state_dict[key_orig])
+
+        self.vision_proj = nn.Linear(self.Qformer.config.hidden_size, embed_dim)
+        self.text_proj = nn.Linear(self.Qformer.config.hidden_size, embed_dim)
+
+        self.itm_head = nn.Linear(self.Qformer.config.hidden_size, 2)
+
+        self.temp = nn.Parameter(0.07 * torch.ones([]))
+
+        self.max_txt_len = max_txt_len 
+        
+        # new tokens
+        self.prompt_tokens = nn.Parameter(
+            torch.zeros(1, num_query_token, self.Qformer.config.hidden_size)
+        )
+        self.prompt_tokens.data.normal_(mean=0.0, std=self.Qformer.config.initializer_range)
+    
+    def forward(self, samples):
+        reference_images = samples["reference_images"]
+        questions = samples["questions"]
+        positive_images = samples["positive_images"]
+        positive_captions = samples["positive_captions"]
+        negative_images = samples["negative_images"]
+        negative_captions = samples["negative_captions"]
+
+        bs = reference_images.size(0)
+        device = reference_images.device
+
+        # image feature
+        reference_image_embeds = self.ln_vision(self.visual_encoder(reference_images))
+        reference_image_atts = torch.ones(reference_image_embeds.size()[:-1], dtype=torch.long).to(device)
+        
+    
+    
+        # question tokens
+        question_tokens = self.tokenizer(
+            questions,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_txt_len,
+            return_tensors="pt",
+        ).to(device)
+        # fusion question and image tokens into a set of multi-modal tokens
+        # print(query_atts.shape, question_tokens.attention_mask.shape)
+
+        query_txt_output = self.Qformer.bert(
+            question_tokens.input_ids,
+            attention_mask=question_tokens.attention_mask,
+            return_dict=True,
+        )
+
+        query_feats = F.normalize(
+            self.text_proj(query_txt_output.last_hidden_state[:, 0, :]), dim=-1
+        )
+
+
+        # query tokens
+        query_tokens = self.query_tokens.expand(reference_image_embeds.shape[0], -1, -1)
+        query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(device)
+        
+
+        positive_image_embeds = self.ln_vision(self.visual_encoder(positive_images))
+        positive_image_atts = torch.ones(positive_image_embeds.size()[:-1], dtype=torch.long).to(device)
+        
+        # fusion_feats = F.normalize(
+        #     self.text_proj(question_output.last_hidden_state[:, 32, :]), dim=-1
+        # )
+        
+        positive_caption_tokens = self.tokenizer(
+            positive_captions,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_txt_len,
+            return_tensors="pt",
+        ).to(device)
+       
+        positive_attention_mask = torch.cat([query_atts, positive_caption_tokens.attention_mask], dim=1)
+
+        positive_fusion_output = self.Qformer.bert(
+            positive_caption_tokens.input_ids,
+            query_embeds=query_tokens,
+            attention_mask=positive_attention_mask,
+            encoder_hidden_states=positive_image_embeds,
+            encoder_attention_mask=positive_image_atts,
+            return_dict=True,
+        )
+        
+        
+        ### ================== Negative ================== ###
+        negative_images = list(zip(*negative_images)) # transpose the list to [batch_size, neg_num]
+        negative_images = [image for negative in negative_images for image in negative] # flatten the list
+        negative_images = torch.stack(negative_images).to(device, non_blocking=True)
+        negative_captions = list(zip(*negative_captions)) # transpose the list to [batch_size, neg_num]
+        negative_captions = [caption for negative in negative_captions for caption in negative] # flatten the list
+
+        negative_image_embeds = self.ln_vision(self.visual_encoder(negative_images))
+        negative_image_atts = torch.ones(negative_image_embeds.size()[:-1], dtype=torch.long).to(device)
+
+        # query tokens
+        neg_query_tokens = self.query_tokens.expand(negative_image_embeds.shape[0], -1, -1)
+        neg_query_atts = torch.ones(neg_query_tokens.size()[:-1], dtype=torch.long).to(device)
+
+        
+        negative_caption_tokens = self.tokenizer(
+            negative_captions,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_txt_len,
+            return_tensors="pt",
+        ).to(device) # [batch_size * neg_num, max_txt_len]
+    
+        negative_attention_mask = torch.cat([neg_query_atts, negative_caption_tokens.attention_mask], dim=1)
+
+        negative_fusion_output = self.Qformer.bert(
+            negative_caption_tokens.input_ids,
+            query_embeds=neg_query_tokens,
+            attention_mask=negative_attention_mask,
+            encoder_hidden_states=negative_image_embeds,
+            encoder_attention_mask=negative_image_atts,
+            return_dict=True,
+        )
+
+        negative_fusion_tokens = negative_fusion_output.last_hidden_state[:, : query_tokens.size(1), :].view(bs, -1, query_tokens.size(1), negative_fusion_output.last_hidden_state.size(-1))
+        positive_fusion_tokens = positive_fusion_output.last_hidden_state[:, : query_tokens.size(1), :].unsqueeze(1)
+        candidate_fusion_tokens = torch.cat([positive_fusion_tokens, negative_fusion_tokens], dim=1)
+        
+        
+        candidate_fusion_feats = F.normalize(
+            self.vision_proj(candidate_fusion_tokens), dim=-1
+        )#[batch_size, 1 + neg_num, hidden_size]
+       
+        
+        # query 2 candidate 
+        #[bs, 1, 1, 256] [bs, 1 + neg_num, 32, 256] 
+
+        sim_q2c = torch.matmul(
+            query_feats.unsqueeze(1).unsqueeze(2), candidate_fusion_feats.permute(0, 1, 3, 2)
+        ).squeeze() #[batch_size, 1 + neg_num, 32]
+        
+
+        assert sim_q2c.size(-1) == 32
+        sim_q2c, _ = sim_q2c.max(-1)
+
+        sim_q2c = sim_q2c / self.temp
+        
+        targets = torch.linspace(0,  0, bs, dtype=int).to(device)
+        
+        loss_q2c = F.cross_entropy(sim_q2c, targets)
+        
+        avg_sim_q2c_first_sample = sim_q2c[:, 0].mean()
+        temp_value = self.temp.clone().detach()
+
+        return loss_q2c, avg_sim_q2c_first_sample, temp_value
+    
+    @torch.no_grad()
+    def extract_features(self, samples, mode="multimodal"):
+        """
+        Extract features for multimodal or unimodal samples.
+        Args:
+            samples (dict): A dictionary of samples, containing the following keys:
+                - image (torch.Tensor): A tensor of shape (B, C, H, W) containing the image.
+                    Raw images should be preprocessed before being passed to feature extractor.
+                - text_input (list): A list of strings containing the text, length B.
+            mode (str): The mode of feature extraction. Can be either "multimodal", "text" or "image".
+                If "multimodal", return image features and multimodal features;
+                if "text", return text features;
+                if "image", return image features.
+                Default: "multimodal".
+        Returns:
+            BlipOutputFeatures: A BlipOutputFeatures object containing the features.
+                See lavis/models/blip_models/blip_outputs.py for more details.
+        """
+        image = samples.get("image", None)
+        caption = samples.get("text_input", None)
+
+        # assert mode is one of "image", "text", "multimodal"
+        assert mode in [
+            "image",
+            "text",
+            "multimodal",
+            "multimodal_query",
+            "multimodal_candidate",
+        ], "mode must be one of 'image', 'text', 'multimodal', 'multimodal_query', 'multimodal_candidate'"
+
+        # initalize output
+        image_embeds, text_embeds, multimodal_embeds = None, None, None
+        image_features, text_features = None, None
+
+        if mode == "image":
+            assert (
+                image is not None
+            ), "Image is not provided for mode 'image' or 'multimodal'"
+            # return query features
+            with self.maybe_autocast():
+                image_embeds_frozen = self.ln_vision(self.visual_encoder(image))
+            image_embeds_frozen = image_embeds_frozen.float()
+            image_atts = torch.ones(
+                image_embeds_frozen.size()[:-1], dtype=torch.long
+            ).to(self.device)
+            query_tokens = self.query_tokens.expand(
+                image_embeds_frozen.shape[0], -1, -1
+            )
+
+            query_output = self.Qformer.bert(
+                query_embeds=query_tokens,
+                encoder_hidden_states=image_embeds_frozen,
+                encoder_attention_mask=image_atts,
+                return_dict=True,
+            )
+            image_embeds = query_output.last_hidden_state
+            image_features = F.normalize(self.vision_proj(image_embeds), dim=-1)
+
+        elif mode == "text":
+            assert (
+                caption is not None
+            ), "text input is None for mode 'text' or 'multimodal'"
+
+            # return text features
+            text = self.tokenizer(caption, return_tensors="pt", padding='max_length', truncation=True, max_length=self.max_txt_len).to(
+                self.device
+            )
+            text_output = self.Qformer.bert(
+                text.input_ids,
+                attention_mask=text.attention_mask,
+                return_dict=True,
+            )
+            text_embeds = text_output.last_hidden_state 
+            text_features = self.text_proj(text_embeds[:, 0, :]) 
+            text_features = F.normalize(text_features, dim=-1) 
+
+        elif mode == "multimodal" or mode == "multimodal_query":
+            # return multimodel query features
+            with self.maybe_autocast():
+                image_embeds_frozen = self.ln_vision(self.visual_encoder(image))
+            image_embeds_frozen = image_embeds_frozen.float()
+            image_atts = torch.ones(
+                image_embeds_frozen.size()[:-1], dtype=torch.long
+            ).to(self.device)
+            query_tokens = self.query_tokens.expand(
+                image_embeds_frozen.shape[0], -1, -1
+            )
+            query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(
+                self.device
+            )
+
+            text = self.tokenizer(caption, return_tensors="pt", padding='max_length', truncation=True, max_length=self.max_txt_len).to(
+                self.device
+            )
+            attention_mask = torch.cat([query_atts, text.attention_mask], dim=1)
+
+            fusion_output = self.Qformer.bert(
+                text.input_ids,
+                query_embeds=query_tokens,
+                attention_mask=attention_mask,
+                encoder_hidden_states=image_embeds_frozen,
+                encoder_attention_mask=image_atts,
+                return_dict=True,
+            )
+            multimodal_embeds = F.normalize(
+               self.vision_proj(fusion_output.last_hidden_state[:, : query_tokens.size(1), :]), dim=-1
+            )
+
+        elif mode == "multimodal_candidate":
+            # return multimodel query features
+            with self.maybe_autocast():
+                image_embeds_frozen = self.ln_vision(self.visual_encoder(image))
+            image_embeds_frozen = image_embeds_frozen.float()
+            image_atts = torch.ones(
+                image_embeds_frozen.size()[:-1], dtype=torch.long
+            ).to(self.device)
+            query_tokens = self.query_tokens.expand(
+                image_embeds_frozen.shape[0], -1, -1
+            )
+            query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(
+                self.device
+            )
+
+            text = self.tokenizer(caption, return_tensors="pt", padding='max_length', truncation=True, max_length=self.max_txt_len).to(
+                self.device
+            )
+            attention_mask = torch.cat([query_atts, text.attention_mask], dim=1)
+
+            fusion_output = self.Qformer.bert(
+                text.input_ids,
+                query_embeds=query_tokens,
+                attention_mask=attention_mask,
+                encoder_hidden_states=image_embeds_frozen,
+                encoder_attention_mask=image_atts,
+                return_dict=True,
+            )
+
+            
+
+        return BlipOutputFeatures(
+            image_embeds=image_embeds,
+            image_embeds_proj=image_features,
+            text_embeds=text_embeds,
+            text_embeds_proj=text_features,
+            multimodal_embeds=multimodal_embeds,
+        )
+    @classmethod
+    def from_config(cls, cfg):
+        vit_model = cfg.get("vit_model", "eva_clip_g")
+        img_size = cfg.get("image_size")
+        num_query_token = cfg.get("num_query_token")
+        cross_attention_freq = cfg.get("cross_attention_freq", 2)
+
+        drop_path_rate = cfg.get("drop_path_rate", 0)
+        use_grad_checkpoint = cfg.get("use_grad_checkpoint", False)
+        vit_precision = cfg.get("vit_precision", "fp16")
+        freeze_vit = cfg.get("freeze_vit", True)
+
+        max_txt_len = cfg.get("max_txt_len", 512)
+
+        model = cls(
+            vit_model=vit_model,
+            img_size=img_size,
+            drop_path_rate=drop_path_rate,
+            use_grad_checkpoint=use_grad_checkpoint,
+            vit_precision=vit_precision,
+            freeze_vit=freeze_vit,
+            num_query_token=num_query_token,
+            cross_attention_freq=cross_attention_freq,
+            max_txt_len=max_txt_len,
+        )
+        model.load_checkpoint_from_config(cfg)
+
+        return model   
+        
