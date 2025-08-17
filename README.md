@@ -1,8 +1,13 @@
 # OMGM: Orchestrate Multiple Granularities and Modalities for Efficient Multimodal Retrieval
-This is the official implementation of OMGM: Orchestrate Multiple Granularities and Modalities for Efficient Multimodal Retrieval.
+
+<p align="center">
+<img src=assets/main.png width=700/>
+</p>
+
+This is the official implementation of [OMGM: Orchestrate Multiple Granularities and Modalities for Efficient Multimodal Retrieval](https://arxiv.org/abs/2505.07879) (ACL 2025 Main Conference).
 
 
-## Requirements
+## 🛠️ Requirements
 1. Create conda environment
 
 ```bash
@@ -15,7 +20,7 @@ conda activate OMGM
 pip install -r requirements.txt
 pip install flash-attn --no-build-isolation
 ```
-## VQA Data and Knowledge Base
+## 📑 VQA Data and Knowledge Base
 We provide the vqa data and knowledge bases used in OMGM. To facilitate comparison with related baselines, we use the VQA data processed by EchoSight, which involves cleaning a small number of samples missing entity images. Additionally, the knowledge base for InfoSeek is the same 100k-sample subset sampled from the E-VQA 2M knowledge base as used by EchoSight. The download links are provided below:
 
 ### Enclyclopedic-VQA
@@ -63,7 +68,7 @@ To download the 100k Knowledge Base in E-VQA:
 Regarding the image data of entity webpages in the knowledge base, we re-crawled the images from Wikipedia to ensure completeness. The entity information, image URLs, and the relative paths for storing the images are recorded in 13 CSV files. These CSV files are provided to facilitate the downloading of knowledge base images:
 
 
-- [Wiki Images CSVs](webpage_holder)
+- [Wiki Images CSVs](https://drive.google.com/file/d/1__laja2XMKA-J3oBT7EFdLxLCEGfpw4r/view?usp=drive_link)
 
 For each CSV file, a corresponding folder needs to be created to download all associated images. The image URLs and their storage paths can be found in the image_URL and img_path columns of the CSV files. After downloading, the directory structure of the wiki images should be as follows:
 
@@ -87,13 +92,13 @@ For each CSV file, a corresponding folder needs to be created to download all as
 
 
 
-## Step 1 : Coarse-Grained Cross-Modal Entity Searching
+## 🔍 Step 1 : Coarse-Grained Cross-Modal Entity Searching
 
 In the initial entity search stage, OMGM utilizes the summaries of entity documents as candidates. We provide the FAISS indexes of the summaries generated for E-VQA and InfoSeek to facilitate direct reproduction of the Step 1 process:
 
-- [E-VQA KB Summary Faiss Index](webpageholder)
+- [E-VQA KB Summary Faiss Index](https://drive.google.com/file/d/1FPx1EOTjcx8zXPoPD9fBQ6cbucF0fL_D/view?usp=drive_link)
 
-- [InfoSeek KB Summary Faiss Index](webpageholder)
+- [InfoSeek KB Summary Faiss Index](https://drive.google.com/file/d/1CE-SyPNKEx6fT09LXoMh4ckmh7jfzG_E/view?usp=drive_link)
 
 
 To perform the step 1 of OMGM, run the following bash script after changing the necessary configurations.
@@ -119,10 +124,10 @@ The step1_img2sum.sh script is used to complete OMGM’s preliminary coarse-grai
 --`retrieval_top_k`: The top-k value used for retrieval.
 
 
-## Step 2a : IT2IT Multimodal Fusion Reranker Training
+## 🔥 Step 2a : IT2IT Multimodal Fusion Reranker Training
 The multimodal fusion reranker of OMGM is trained using E-VQA datasets. The top 20 entities in the training samples are obtained through Step 1 processing. Based on these top 20 entities, we further select 15 negative pairs for each sample following the method described in the paper. We provide our Hard_Neg result file as follows:
 
-- [Hard_Neg Tranning Samples For Reranker](webpageholder)
+- [Hard_Neg Tranning Samples For Reranker](https://drive.google.com/file/d/1X9sOZV5jSielgszfIcncvcoCtDumHkBD/view?usp=drive_link)
 
 
 To train the multimodal fusion reranker, run the bash script after changing the necessary configurations.
@@ -164,10 +169,10 @@ The IT2IT_reranker_training.sh script is used to fine-tune the multimodal fusion
 
 --`wandb`: Whether to use wandb for training process logging; set the value to 1 if used, otherwise 0. Remember to set your wandb API key in the shell using `WANDB_API_KEY` if you want to use wandb.
 
-## Step 2b : Hybrid-Grained Multimodal-Fused Reranking
+## 🔬 Step 2b : Hybrid-Grained Multimodal-Fused Reranking
 After the training in Step 2a described above, we obtain a multimodal fusion reranker capable of performing image-text matching between the query and candidate sides. Here, we provide the trained reranker weights primarily used in our experiments:
 
-- [Multimodal Fusion Reranker Weights](webpageholder)
+- [Multimodal Fusion Reranker Weights](https://drive.google.com/file/d/1K1Mxn_ePj1cCHdbgESK8Wz_Xrw1bhBEM/view?usp=drive_link)
 
 
 Using this reranker, we can perform hybrid-grained multimodal-fused reranking by running the following command after making the necessary parameter adjustments.
@@ -197,10 +202,10 @@ The step2_IT2IT_rerank.sh script is used to perform entities reranking with spec
 
 --`save_result_path`: Path to the result json file would be saved.
 
-## Step 3 : Fine-Grained Section-Augmented Generation
+## 💡 Step 3 : Fine-Grained Section-Augmented Generation
 In this stage, the generator model we use can be either a pretrained LLM/MLLM or a fine-tuned model. The fine-tuned LLaVA-1.5-7B mentioned in the main results of the paper is detailed in the Appendix C.3. Here, we provide the corresponding fine-tuned model weights:
 
-- [Finetuned LLaVA-1.5-7B Generator](webpageholder)
+- [Finetuned LLaVA-1.5-7B Generator](https://drive.google.com/file/d/17gaVltG2acdWKyG8oBKsrvUURNnqVZGD/view?usp=drive_link)
 
 By running the following command, we can perform top-1 section selection within the top-1 entity using the text similarity between the section and the question, along with the multimodal similarity from Step 2, to assist the generator in answering questions.
 
@@ -226,7 +231,7 @@ The step3_secaugmented_gen.sh script is used to perform section-augmented genera
 --`llm_checkpoint`: Path to the local LLM checkpoint file. If not using a checkpoint, this parameter can be omitted or set to `None`.
 
 
-## Citation
+## 📖 Citation
 ```
 @article{yang2025omgm,
   title={OMGM: Orchestrate Multiple Granularities and Modalities for Efficient Multimodal Retrieval},
@@ -235,5 +240,5 @@ The step3_secaugmented_gen.sh script is used to perform section-augmented genera
   year={2025}
 }
 ```
-## Acknowledgements
+## 💖 Acknowledgements
 Thanks to the code of [LAVIS](https://github.com/salesforce/LAVIS/tree/main) and [LLaVA](https://github.com/haotian-liu/LLaVA/tree/main/) and data of [Encyclopedic-VQA](https://github.com/google-research/google-research/tree/master/encyclopedic_vqa), [EchoSight](https://github.com/Go2Heart/EchoSight) and [InfoSeek](https://github.com/open-vision-language/infoseek).
