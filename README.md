@@ -203,9 +203,11 @@ The step2_IT2IT_rerank.sh script is used to perform entities reranking with spec
 --`save_result_path`: Path to the result json file would be saved.
 
 ## 💡 Step 3 : Fine-Grained Section-Augmented Generation
-In this stage, the generator model we use can be either a pretrained LLM/MLLM or a fine-tuned model. The fine-tuned LLaVA-1.5-7B mentioned in the main results of the paper is detailed in the Appendix C.3. Here, we provide the corresponding fine-tuned model weights:
+In this stage, the generator model we use can be either a pretrained LLM/MLLM or a fine-tuned model. The fine-tuned LLaVA-1.5-7B mentioned in the main results of the paper is detailed in the Appendix C.3. Here, we provide the corresponding fine-tuned model weights which is trained and tested in E-VQA:
 
-- [Finetuned LLaVA-1.5-7B Generator](https://drive.google.com/file/d/17gaVltG2acdWKyG8oBKsrvUURNnqVZGD/view?usp=drive_link)
+- [Finetuned E-VQA LLaVA-1.5-7B Generator](https://drive.google.com/file/d/17gaVltG2acdWKyG8oBKsrvUURNnqVZGD/view?usp=drive_link)
+
+The fine-tuned model used in InfoSeek was trained in the same setting mentioned in the Appendix C.3, which is based on the train dataset of InfoSeek.
 
 By running the following command, we can perform top-1 section selection within the top-1 entity using the text similarity between the section and the question, along with the multimodal similarity from Step 2, to assist the generator in answering questions.
 
